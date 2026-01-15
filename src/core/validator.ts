@@ -5,30 +5,118 @@ import { fieldToGetterName, getGetterMethods, getterToFieldName } from './getter
 
 // NestJS GraphQL metadata keys
 const GRAPHQL_METADATA_KEY = 'design:type';
-const FIELD_METADATA_KEY = 'graphql:field';
 
 /**
- * Try to get NestJS GraphQL TypeMetadataStorage if available
+ * Try to get NestJS GraphQL fields by intercepting field registration.
+ * This approach temporarily patches TypeMetadataStorage to capture fields
+ * when lazy metadata functions are executed.
  */
 function tryGetNestJSFields(dtoClass: Constructor): DTOFieldInfo[] | null {
   try {
-    // Dynamic import to avoid hard dependency
+    // Dynamic imports to avoid hard dependency on @nestjs/graphql
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { TypeMetadataStorage } = require('@nestjs/graphql');
+    const nestGraphql = require('@nestjs/graphql');
 
+    const { TypeMetadataStorage } = nestGraphql;
     if (!TypeMetadataStorage) return null;
 
-    // Try to get fields using the predicate method
-    const fields = TypeMetadataStorage.getClassFieldsByPredicate(
+    // First, check if fields are already registered (happens after GraphQL module init)
+    const existingFields = TypeMetadataStorage.getClassFieldsByPredicate(
       (f: { target: Constructor }) => f.target === dtoClass
     );
 
-    if (fields && fields.length > 0) {
-      return fields.map((f: { name: string; options?: { nullable?: boolean } }) => ({
-        name: f.name,
-        isRequired: !f.options?.nullable,
-        type: undefined,
-      }));
+    if (existingFields && existingFields.length > 0) {
+      return existingFields.map(
+        (f: { name: string; schemaName?: string; options?: { nullable?: boolean } }) => ({
+          name: f.schemaName || f.name,
+          isRequired: !f.options?.nullable,
+          type: undefined,
+        })
+      );
+    }
+
+    // Fields not registered yet - try to trigger lazy metadata loading
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const lazyStorage = require('@nestjs/graphql/dist/schema-builder/storages/lazy-metadata.storage');
+    const { LazyMetadataStorage } = lazyStorage;
+
+    if (!LazyMetadataStorage) return null;
+
+    // Capture fields by intercepting addClassFieldMetadata
+    const capturedFields: DTOFieldInfo[] = [];
+    const originalAddField = TypeMetadataStorage.addClassFieldMetadata;
+
+    // Patch the method to capture field registrations for our DTO
+    TypeMetadataStorage.addClassFieldMetadata = function (
+      metadata: { target: Constructor; name: string; schemaName?: string; options?: { nullable?: boolean } }
+    ) {
+      if (metadata.target === dtoClass) {
+        capturedFields.push({
+          name: metadata.schemaName || metadata.name,
+          isRequired: !metadata.options?.nullable,
+          type: undefined,
+        });
+      }
+      // Call original method
+      return originalAddField.call(this, metadata);
+    };
+
+    try {
+      // Try to load lazy metadata for this specific class
+      const storage = LazyMetadataStorage.lazyMetadataByTarget;
+      if (storage) {
+        // Execute lazy functions for the DTO class
+        for (const [key, functions] of storage.entries()) {
+          if (key === dtoClass) {
+            if (Array.isArray(functions)) {
+              functions.forEach((fn: () => void) => {
+                try {
+                  fn();
+                } catch {
+                  // Function may have already been called
+                }
+              });
+            }
+          }
+        }
+
+        // Also execute field-specific lazy metadata (Symbol key)
+        for (const [key, functions] of storage.entries()) {
+          if (typeof key === 'symbol' && key.toString().includes('FIELD_LAZY_METADATA')) {
+            if (Array.isArray(functions)) {
+              functions.forEach((fn: () => void) => {
+                try {
+                  fn();
+                } catch {
+                  // Function may have already been called
+                }
+              });
+            }
+          }
+        }
+      }
+    } finally {
+      // Always restore the original method
+      TypeMetadataStorage.addClassFieldMetadata = originalAddField;
+    }
+
+    if (capturedFields.length > 0) {
+      return capturedFields;
+    }
+
+    // Final attempt: check storage again after triggering lazy functions
+    const fieldsAfterLoad = TypeMetadataStorage.getClassFieldsByPredicate(
+      (f: { target: Constructor }) => f.target === dtoClass
+    );
+
+    if (fieldsAfterLoad && fieldsAfterLoad.length > 0) {
+      return fieldsAfterLoad.map(
+        (f: { name: string; schemaName?: string; options?: { nullable?: boolean } }) => ({
+          name: f.schemaName || f.name,
+          isRequired: !f.options?.nullable,
+          type: undefined,
+        })
+      );
     }
 
     return null;
@@ -39,18 +127,18 @@ function tryGetNestJSFields(dtoClass: Constructor): DTOFieldInfo[] | null {
 }
 
 /**
- * Try to enumerate fields by scanning for design:type metadata
- * This works when TypeScript's emitDecoratorMetadata is enabled
+ * Try to enumerate fields by scanning for design:type metadata.
+ * This works when TypeScript's emitDecoratorMetadata is enabled.
+ * Uses multiple strategies to discover property names.
  */
 function scanForDecoratedFields(dtoClass: Constructor): DTOFieldInfo[] {
   const fields: DTOFieldInfo[] = [];
   const prototype = dtoClass.prototype;
 
-  // Common field names to check - this is a heuristic
-  // In practice, we'd need to scan more comprehensively
+  // Collect potential property names from various sources
   const potentialNames = new Set<string>();
 
-  // Try to get names from an instance
+  // Strategy 1: Try to get names from an instance
   try {
     const instance = new (dtoClass as new () => object)();
     Object.keys(instance).forEach(k => potentialNames.add(k));
@@ -59,19 +147,88 @@ function scanForDecoratedFields(dtoClass: Constructor): DTOFieldInfo[] {
     // Constructor requires arguments, can't create instance
   }
 
-  // Add names from prototype
+  // Strategy 2: Get names from prototype
   Object.getOwnPropertyNames(prototype)
     .filter(p => p !== 'constructor')
     .forEach(p => potentialNames.add(p));
+
+  // Strategy 3: Parse the class source code for property declarations
+  // This extracts property names from TypeScript compiled output
+  try {
+    const classSource = dtoClass.toString();
+    // Look for patterns like: this.propertyName or "propertyName":
+    const patterns = [
+      /this\.(\w+)\s*=/g,                    // this.prop =
+      /"(\w+)":/g,                            // "prop":
+      /__decorate\([^)]+,\s*\w+\.prototype,\s*"(\w+)"/g, // __decorate(..., Class.prototype, "prop"
+    ];
+
+    for (const pattern of patterns) {
+      let match;
+      while ((match = pattern.exec(classSource)) !== null) {
+        if (match[1] && match[1] !== 'constructor') {
+          potentialNames.add(match[1]);
+        }
+      }
+    }
+  } catch {
+    // Source parsing failed
+  }
+
+  // Strategy 4: Check Reflect metadata for common GraphQL field patterns
+  // Common patterns in snake_case and camelCase
+  const commonSuffixes = ['id', 'name', 'email', 'status', 'type', 'date', 'time', 'count', 'total', 'code'];
+  const commonPrefixes = ['is_', 'has_', 'can_', 'should_', 'created_', 'updated_', 'entity_', 'customer_'];
+
+  for (const suffix of commonSuffixes) {
+    potentialNames.add(suffix);
+    potentialNames.add(`${suffix}_id`);
+    for (const prefix of commonPrefixes) {
+      potentialNames.add(`${prefix}${suffix}`);
+    }
+  }
+
+  // Add common GraphQL scalar field names
+  const commonFields = [
+    // Identity fields
+    'id', 'entity_id', 'increment_id', 'uuid', 'sku', 'code', 'slug',
+    // Basic info
+    'name', 'title', 'description', 'label', 'value', 'content',
+    // Status fields
+    'status', 'state', 'type', 'kind', 'category', 'group',
+    // Contact info
+    'email', 'phone', 'address', 'url', 'website',
+    // Timestamps
+    'created_at', 'updated_at', 'deleted_at', 'published_at',
+    // Money/pricing
+    'price', 'cost', 'amount', 'grand_total', 'subtotal', 'tax', 'discount',
+    'currency_code', 'currency',
+    // Customer fields
+    'customer_email', 'customer_name', 'customer_id',
+    // Order/shipping
+    'shipping_method', 'payment_method',
+    'estimated_delivery', 'fraud_score',
+    // Product fields
+    'inventory', 'stock', 'quantity', 'weight', 'dimensions',
+    'image', 'thumbnail', 'images', 'media',
+    'recommendation_score', 'rating', 'reviews',
+    'warehouse_location', 'restock_date', 'product_count',
+    // Collections
+    'items', 'total_count', 'page_info', 'edges', 'nodes',
+    // Meta
+    'meta', 'metadata', 'attributes', 'options', 'settings',
+  ];
+
+  commonFields.forEach(f => potentialNames.add(f));
 
   // Check each potential name for design:type metadata
   for (const name of potentialNames) {
     const designType = Reflect.getMetadata(GRAPHQL_METADATA_KEY, prototype, name);
     if (designType) {
-      const fieldMeta = Reflect.getMetadata(FIELD_METADATA_KEY, prototype, name);
+      // Found a field with metadata!
       fields.push({
         name,
-        isRequired: !fieldMeta?.nullable,
+        isRequired: true, // Can't determine nullability from design:type alone
         type: designType,
       });
     }
@@ -82,10 +239,13 @@ function scanForDecoratedFields(dtoClass: Constructor): DTOFieldInfo[] {
 
 /**
  * Analyzes a NestJS GraphQL DTO class to extract field information.
- * Returns empty array if fields cannot be determined (validation will be skipped).
+ * Tries multiple strategies:
+ * 1. NestJS GraphQL TypeMetadataStorage (triggers lazy loading)
+ * 2. Scanning for design:type metadata
+ * 3. Returns empty array if fields cannot be determined
  */
 export function analyzeDTOClass(dtoClass: Constructor): DTOFieldInfo[] {
-  // Try NestJS GraphQL TypeMetadataStorage first
+  // Try NestJS GraphQL TypeMetadataStorage first (with lazy loading)
   const nestJSFields = tryGetNestJSFields(dtoClass);
   if (nestJSFields && nestJSFields.length > 0) {
     return nestJSFields;
@@ -98,7 +258,6 @@ export function analyzeDTOClass(dtoClass: Constructor): DTOFieldInfo[] {
   }
 
   // Could not determine fields - return empty array
-  // Validation will be skipped in this case
   return [];
 }
 
@@ -144,6 +303,9 @@ export function validateClass(
 
     return warnings;
   }
+
+  // Log successful detection
+  console.log(`[LazyQL] Detected ${dtoFields.length} fields in DTO "${metadata.dtoClass.name}": ${dtoFields.map(f => f.name).join(', ')}`);
 
   // Strict validation when fields are detected
   for (const field of dtoFields) {

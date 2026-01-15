@@ -179,6 +179,53 @@ LazyQL validates your classes at startup:
 
 This is completely transparent to Apollo/Cosmo - no plugins or configuration needed.
 
+## Test Coverage
+
+LazyQL includes comprehensive unit tests:
+
+```bash
+npm test
+```
+
+- **getter-mapper:** 10 tests for field name conversion
+- **proxy-factory:** 18 tests for Proxy behavior and @Shared caching
+- **validator:** 11 tests for DTO field detection and validation
+
+### Test Microservice
+
+The `test-ms/` directory contains a NestJS application demonstrating LazyQL with:
+
+- **Orders module:** 10 fields with @Shared methods
+- **Products module:** Nested DTOs (CategoryDTO, InventoryDTO)
+- **Comparison endpoints:** LazyQL vs traditional approach
+
+```bash
+cd test-ms
+npm install
+npm run start
+# Visit http://localhost:3000/graphql
+```
+
+Example queries to compare performance:
+
+```graphql
+# LazyQL - only fetches requested fields
+query {
+  product(id: 1) {
+    name
+    price
+  }
+}
+
+# Traditional - fetches EVERYTHING
+query {
+  productTraditional(id: 1) {
+    name
+    price
+  }
+}
+```
+
 ## Requirements
 
 - Node.js 18+
