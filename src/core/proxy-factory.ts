@@ -1,5 +1,7 @@
-import type { LazyQLMetadata } from '../types.js';
+import type { Constructor, LazyQLMetadata } from '../types.js';
 import { fieldToGetterName } from './getter-mapper.js';
+import { log, handleError, isDebugEnabled, getConfig } from './config.js';
+import { getClassMetadata } from './registry.js';
 
 /**
  * Symbol used to access the original instance from a proxy
@@ -28,7 +30,9 @@ const PENDING_SHARED = Symbol('lazyql:pendingShared');
  */
 function wrapSharedMethods<T extends object>(
   instance: T,
-  sharedMethods: Set<string>
+  sharedMethods: Set<string>,
+  className: string,
+  debug: boolean
 ): void {
   // Initialize cache storage on the instance
   const cache = new Map<string, unknown>();
@@ -49,24 +53,47 @@ function wrapSharedMethods<T extends object>(
     (instance as Record<string, unknown>)[methodName] = function (this: T, ...args: unknown[]) {
       // Check if already cached
       if (cache.has(methodName)) {
+        if (debug) {
+          log('debug', `@Shared cache hit: ${className}.${methodName}()`);
+        }
         return cache.get(methodName);
       }
 
       // Check if there's a pending promise
       if (pending.has(methodName)) {
+        if (debug) {
+          log('debug', `@Shared pending hit: ${className}.${methodName}()`);
+        }
         return pending.get(methodName);
       }
+
+      if (debug) {
+        log('debug', `@Shared executing: ${className}.${methodName}()`);
+      }
+
+      const startTime = getConfig().timing ? performance.now() : 0;
 
       // Execute the original method
       const result = original.apply(this, args);
 
       // Handle promises
       if (result instanceof Promise) {
-        const promise = result.then(value => {
-          cache.set(methodName, value);
-          pending.delete(methodName);
-          return value;
-        });
+        const promise = result
+          .then(value => {
+            cache.set(methodName, value);
+            pending.delete(methodName);
+
+            if (getConfig().timing) {
+              const duration = performance.now() - startTime;
+              log('debug', `@Shared completed: ${className}.${methodName}()`, { duration: `${duration.toFixed(2)}ms` });
+            }
+
+            return value;
+          })
+          .catch(error => {
+            pending.delete(methodName);
+            throw error; // Re-throw to propagate the error
+          });
 
         pending.set(methodName, promise);
         return promise;
@@ -74,9 +101,69 @@ function wrapSharedMethods<T extends object>(
 
       // Sync result - cache directly
       cache.set(methodName, result);
+
+      if (getConfig().timing) {
+        const duration = performance.now() - startTime;
+        log('debug', `@Shared completed: ${className}.${methodName}()`, { duration: `${duration.toFixed(2)}ms` });
+      }
+
       return result;
     };
   }
+}
+
+/**
+ * Wraps a value in a LazyQL proxy if it's an instance of a registered class.
+ * Handles arrays by mapping through elements.
+ *
+ * @param value - The value to potentially wrap
+ * @param nestedProxy - Whether nested proxy wrapping is enabled
+ * @param debug - Whether debug mode is enabled
+ * @returns The original value or a proxied version
+ */
+function maybeWrapNested(value: unknown, nestedProxy: boolean, debug: boolean): unknown {
+  if (!nestedProxy) return value;
+
+  // Already a proxy - return as is
+  if (isLazyProxy(value)) return value;
+
+  // Null/undefined - return as is
+  if (value == null) return value;
+
+  // Array - map through elements
+  if (Array.isArray(value)) {
+    return value.map(item => maybeWrapNested(item, true, debug));
+  }
+
+  // Object instance - check if it's a registered class
+  if (typeof value === 'object') {
+    const constructor = value.constructor as Constructor;
+
+    // Skip plain objects (Object constructor) and built-in types
+    if (constructor === Object || constructor.name === 'Object') {
+      return value;
+    }
+
+    const metadata = getClassMetadata(constructor);
+
+    if (metadata) {
+      // It's an instance of a registered LazyQL class but not proxied
+      // This can happen if the instance was created before decoration was applied
+      if (debug) {
+        log('debug', `Wrapping nested object: ${constructor.name}`);
+      }
+      return createLazyProxy(value as object, metadata, constructor.name);
+    }
+  }
+
+  return value;
+}
+
+/**
+ * Checks if an object is a LazyQL proxy
+ */
+export function isLazyProxy(obj: unknown): boolean {
+  return typeof obj === 'object' && obj !== null && (obj as Record<symbol, boolean>)[IS_LAZY_PROXY] === true;
 }
 
 /**
@@ -85,16 +172,20 @@ function wrapSharedMethods<T extends object>(
  * When GraphQL/Apollo accesses a field like `proxy.status`, the proxy:
  * 1. Looks up the getter method for that field
  * 2. Calls the getter on the original instance
- * 3. Returns the result
+ * 3. Returns the result (with error handling)
  *
  * This ensures only requested fields have their getters executed.
  */
 export function createLazyProxy<T extends object>(
   instance: T,
-  metadata: LazyQLMetadata
+  metadata: LazyQLMetadata,
+  className: string
 ): T {
+  const debug = isDebugEnabled(metadata.options.debug);
+  const nestedProxy = metadata.options.nestedProxy ?? false;
+
   // Wrap @Shared methods on the instance for caching
-  wrapSharedMethods(instance, metadata.sharedMethods);
+  wrapSharedMethods(instance, metadata.sharedMethods, className, debug);
 
   return new Proxy(instance, {
     get(target, prop, receiver) {
@@ -132,8 +223,50 @@ export function createLazyProxy<T extends object>(
       const getter = (target as Record<string, unknown>)[getterName];
 
       if (typeof getter === 'function') {
-        // Execute the getter (if it's @Shared, it's already wrapped)
-        return getter.call(target);
+        if (debug) {
+          log('debug', `Executing getter: ${className}.${getterName}() for field "${fieldName}"`);
+        }
+
+        const startTime = getConfig().timing ? performance.now() : 0;
+
+        try {
+          // Execute the getter (if it's @Shared, it's already wrapped)
+          const result = getter.call(target);
+
+          // Handle async results for timing and error handling
+          if (result instanceof Promise) {
+            return result
+              .then(value => {
+                if (getConfig().timing) {
+                  const duration = performance.now() - startTime;
+                  log('debug', `Getter completed: ${className}.${getterName}()`, { duration: `${duration.toFixed(2)}ms` });
+                }
+                // Wrap nested objects if enabled
+                return maybeWrapNested(value, nestedProxy, debug);
+              })
+              .catch(error => {
+                const handledError = handleError(className, fieldName, getterName, error as Error);
+                if (handledError) {
+                  throw handledError;
+                }
+                return null; // Error was suppressed
+              });
+          }
+
+          if (getConfig().timing) {
+            const duration = performance.now() - startTime;
+            log('debug', `Getter completed: ${className}.${getterName}()`, { duration: `${duration.toFixed(2)}ms` });
+          }
+
+          // Wrap nested objects if enabled
+          return maybeWrapNested(result, nestedProxy, debug);
+        } catch (error) {
+          const handledError = handleError(className, fieldName, getterName, error as Error);
+          if (handledError) {
+            throw handledError;
+          }
+          return null; // Error was suppressed
+        }
       }
 
       // If no getter found, check if it's an optional field
@@ -199,13 +332,6 @@ export function createLazyProxy<T extends object>(
       return Reflect.getOwnPropertyDescriptor(target, prop);
     },
   });
-}
-
-/**
- * Checks if an object is a LazyQL proxy
- */
-export function isLazyProxy(obj: unknown): boolean {
-  return typeof obj === 'object' && obj !== null && (obj as Record<symbol, boolean>)[IS_LAZY_PROXY] === true;
 }
 
 /**

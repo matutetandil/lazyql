@@ -101,13 +101,22 @@ import 'reflect-metadata';
 
 ## API
 
-### `@LazyQL(DTO)`
+### `@LazyQL(DTO, options?)`
 
 Class decorator that enables lazy field resolution.
 
 ```typescript
 @LazyQL(OrderSummaryDTO)
 class OrderSummary {
+  // ...
+}
+
+// With options
+@LazyQL(OrderSummaryDTO, {
+  debug: true,      // Enable debug logging for this class
+  nestedProxy: true // Auto-wrap nested LazyQL instances
+})
+class DebugOrderSummary {
   // ...
 }
 ```
@@ -163,6 +172,135 @@ By default, LazyQL maps `snake_case` DTO fields to `getCamelCase` methods:
 
 Use `@Field('field_name')` to override this convention when needed.
 
+## Configuration
+
+### Global Configuration
+
+```typescript
+import { configure } from 'lazyql';
+
+configure({
+  debug: true,              // Enable debug logging globally
+  timing: true,             // Log execution time for getters
+  logger: (level, msg, meta) => {
+    // Custom logger function
+    myLogger[level](msg, meta);
+  },
+  onError: (ctx) => {
+    // Custom error handler
+    // Return modified error, or null to suppress
+    return new CustomError(`${ctx.className}.${ctx.fieldName}: ${ctx.error.message}`);
+  }
+});
+```
+
+### Error Handling
+
+Errors in getters are properly handled and propagated to GraphQL:
+
+```typescript
+@LazyQL(OrderDTO)
+class Order {
+  async getCustomerEmail() {
+    // If this throws, the error is caught and optionally transformed
+    return await this.db.getCustomerEmail(this.id);
+  }
+}
+
+// Configure custom error handling
+configure({
+  onError: ({ className, fieldName, getterName, error }) => {
+    console.error(`Error in ${className}.${getterName}(): ${error.message}`);
+    return error; // Return error to propagate, or null to suppress
+  }
+});
+```
+
+## Class Inheritance
+
+LazyQL supports class inheritance naturally:
+
+```typescript
+@LazyQL(BaseOrderDTO)
+class BaseOrderModel {
+  getEntityId() { return this.id; }
+  getStatus() { return this.status; }
+}
+
+@LazyQL(ExtendedOrderDTO)
+class ExtendedOrderModel extends BaseOrderModel {
+  // Inherits getEntityId() and getStatus()
+  getExtraField() { return this.extra; }
+}
+```
+
+## Nested LazyQL Objects
+
+When `nestedProxy: true` is enabled, returned objects that are instances of registered LazyQL classes are automatically wrapped:
+
+```typescript
+@LazyQL(CategoryDTO)
+class CategoryModel {
+  getName() { return this.name; }
+  getProductCount() { return this.db.countProducts(this.id); }
+}
+
+@LazyQL(ProductDTO, { nestedProxy: true })
+class ProductModel {
+  getCategory() {
+    // Returns a CategoryModel instance - automatically proxied
+    return new CategoryModel(this.categoryId, this.db);
+  }
+
+  getRelatedProducts() {
+    // Arrays are also handled
+    return this.relatedIds.map(id => new ProductModel(id, this.db));
+  }
+}
+```
+
+## DataLoader Integration
+
+LazyQL integrates naturally with DataLoader to solve the N+1 problem:
+
+```typescript
+// Create request-scoped loaders
+function createLoaders(context) {
+  return {
+    customer: new DataLoader(ids => db.getCustomers(ids)),
+    product: new DataLoader(ids => db.getProducts(ids))
+  };
+}
+
+@LazyQL(OrderDTO)
+class OrderModel {
+  constructor(
+    private id: number,
+    private customerId: number,
+    private loaders: Loaders
+  ) {}
+
+  getEntityId() { return this.id; }
+
+  async getCustomerEmail() {
+    // Uses DataLoader - batched across all OrderModel instances
+    const customer = await this.loaders.customer.load(this.customerId);
+    return customer.email;
+  }
+}
+
+// In resolver
+async orders(context) {
+  const loaders = createLoaders(context);
+  const ids = await db.getOrderIds();
+  return ids.map(id => new OrderModel(id, loaders));
+}
+```
+
+**Result:** If 100 orders reference 50 unique customers:
+- Without DataLoader: 100 database calls
+- With DataLoader: 1 batched database call
+
 ## Validation
 
 LazyQL validates your classes at startup:
@@ -188,8 +326,11 @@ npm test
 ```
 
 - **getter-mapper:** 10 tests for field name conversion
-- **proxy-factory:** 18 tests for Proxy behavior and @Shared caching
-- **validator:** 11 tests for DTO field detection and validation
+- **proxy-factory:** 35 tests for Proxy behavior, @Shared caching, error handling, debug mode, inheritance, and nested proxy
+- **validator:** 14 tests for DTO field detection, validation, and nullability detection
+- **dataloader-pattern:** 4 tests demonstrating DataLoader integration patterns
+
+**Total: 63 tests**
 
 ### Test Microservice
 

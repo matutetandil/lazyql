@@ -31,6 +31,7 @@ function tryGetNestJSFields(dtoClass: Constructor): DTOFieldInfo[] | null {
           name: f.schemaName || f.name,
           isRequired: !f.options?.nullable,
           type: undefined,
+          detectionMethod: 'nestjs-graphql' as const,
         })
       );
     }
@@ -55,6 +56,7 @@ function tryGetNestJSFields(dtoClass: Constructor): DTOFieldInfo[] | null {
           name: metadata.schemaName || metadata.name,
           isRequired: !metadata.options?.nullable,
           type: undefined,
+          detectionMethod: 'nestjs-graphql' as const,
         });
       }
       // Call original method
@@ -115,6 +117,7 @@ function tryGetNestJSFields(dtoClass: Constructor): DTOFieldInfo[] | null {
           name: f.schemaName || f.name,
           isRequired: !f.options?.nullable,
           type: undefined,
+          detectionMethod: 'nestjs-graphql' as const,
         })
       );
     }
@@ -226,10 +229,12 @@ function scanForDecoratedFields(dtoClass: Constructor): DTOFieldInfo[] {
     const designType = Reflect.getMetadata(GRAPHQL_METADATA_KEY, prototype, name);
     if (designType) {
       // Found a field with metadata!
+      // Mark as required but with low confidence (design-type can't detect nullability)
       fields.push({
         name,
         isRequired: true, // Can't determine nullability from design:type alone
         type: designType,
+        detectionMethod: 'design-type' as const,
       });
     }
   }
@@ -329,9 +334,22 @@ export function validateClass(
     const hasGetter = getterMethods.includes(expectedGetter);
 
     if (!hasGetter) {
-      if (field.isRequired) {
+      // For design-type detection, we can't reliably determine nullability
+      // so we warn instead of throwing errors
+      const isLowConfidence = field.detectionMethod === 'design-type';
+
+      if (field.isRequired && !isLowConfidence) {
+        // High confidence required field (from NestJS metadata) - throw error
         throw new MissingGetterError(className, field.name);
+      } else if (field.isRequired && isLowConfidence) {
+        // Low confidence required field (from design:type) - warn instead
+        warnings.push(
+          `Field "${field.name}" detected via design:type has no getter. ` +
+          `Cannot determine if required. Expected: ${expectedGetter}(). Will return null.`
+        );
+        metadata.optionalFields.add(field.name);
       } else {
+        // Optional field - just warn
         warnings.push(
           `Optional field "${field.name}" has no getter. Expected: ${expectedGetter}(). Will return null.`
         );

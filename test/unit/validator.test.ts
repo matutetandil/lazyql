@@ -29,6 +29,7 @@ function createMetadata(
     requiredFields: new Set(),
     optionalFields: new Set(),
     sharedMethods: new Set(),
+    options: {},
     ...overrides,
   };
 }
@@ -199,6 +200,67 @@ describe('validator', () => {
 
       // getSharedData should not be mapped as a field getter
       expect(metadata.fieldMappings.has('shared_data')).toBe(false);
+    });
+  });
+
+  describe('nullability detection', () => {
+    it('should include detectionMethod in analyzed fields', () => {
+      const DTO = createDecoratedDTO();
+      const fields = analyzeDTOClass(DTO);
+
+      // All fields should have design-type detection method
+      for (const field of fields) {
+        expect(field.detectionMethod).toBe('design-type');
+      }
+    });
+
+    it('should warn instead of throwing for design-type detected fields without getters', () => {
+      class DTO {}
+      // These fields are detected via design:type - low confidence
+      // Use field names that are in the common fields list in scanForDecoratedFields
+      Reflect.defineMetadata('design:type', String, DTO.prototype, 'status');
+      Reflect.defineMetadata('design:type', String, DTO.prototype, 'email'); // Common field name
+
+      class TestModel {
+        getStatus() {
+          return 'ok';
+        }
+        // No getter for email
+      }
+
+      const metadata = createMetadata(DTO);
+
+      // Should NOT throw because design:type fields have low confidence
+      expect(() => validateClass(TestModel, metadata)).not.toThrow();
+
+      const warnings = validateClass(TestModel, metadata);
+
+      // Should have a warning about the missing getter
+      expect(warnings.some(w => w.includes('email') && w.includes('design:type'))).toBe(true);
+
+      // Field should be marked as optional since we can't determine nullability
+      expect(metadata.optionalFields.has('email')).toBe(true);
+    });
+
+    it('should register missing design-type fields as optional', () => {
+      class DTO {}
+      // Use common field names that will be detected
+      Reflect.defineMetadata('design:type', String, DTO.prototype, 'name');
+      Reflect.defineMetadata('design:type', String, DTO.prototype, 'title');
+
+      class TestModel {
+        getName() {
+          return 'value';
+        }
+        // No getter for title
+      }
+
+      const metadata = createMetadata(DTO);
+      validateClass(TestModel, metadata);
+
+      // Missing fields from design:type should be in optionalFields, not requiredFields
+      expect(metadata.optionalFields.has('title')).toBe(true);
+      expect(metadata.requiredFields.has('title')).toBe(false);
     });
   });
 
