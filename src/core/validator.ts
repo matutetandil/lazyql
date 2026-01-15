@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import type { Constructor, DTOFieldInfo, LazyQLMetadata } from '../types.js';
-import { MissingGetterError, InvalidDTOError } from '../errors.js';
+import { MissingGetterError } from '../errors.js';
 import { fieldToGetterName, getGetterMethods, getterToFieldName } from './getter-mapper.js';
 
 // NestJS GraphQL metadata keys
@@ -8,62 +8,72 @@ const GRAPHQL_METADATA_KEY = 'design:type';
 const FIELD_METADATA_KEY = 'graphql:field';
 
 /**
- * Analyzes a NestJS GraphQL DTO class to extract field information.
+ * Try to get NestJS GraphQL TypeMetadataStorage if available
  */
-export function analyzeDTOClass(dtoClass: Constructor): DTOFieldInfo[] {
+function tryGetNestJSFields(dtoClass: Constructor): DTOFieldInfo[] | null {
+  try {
+    // Dynamic import to avoid hard dependency
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { TypeMetadataStorage } = require('@nestjs/graphql');
+
+    if (!TypeMetadataStorage) return null;
+
+    // Try to get fields using the predicate method
+    const fields = TypeMetadataStorage.getClassFieldsByPredicate(
+      (f: { target: Constructor }) => f.target === dtoClass
+    );
+
+    if (fields && fields.length > 0) {
+      return fields.map((f: { name: string; options?: { nullable?: boolean } }) => ({
+        name: f.name,
+        isRequired: !f.options?.nullable,
+        type: undefined,
+      }));
+    }
+
+    return null;
+  } catch {
+    // NestJS GraphQL not available or different version
+    return null;
+  }
+}
+
+/**
+ * Try to enumerate fields by scanning for design:type metadata
+ * This works when TypeScript's emitDecoratorMetadata is enabled
+ */
+function scanForDecoratedFields(dtoClass: Constructor): DTOFieldInfo[] {
   const fields: DTOFieldInfo[] = [];
   const prototype = dtoClass.prototype;
 
-  // Get all property names from the DTO class
-  const instance = Object.create(prototype);
-  const propertyNames = Object.getOwnPropertyNames(instance);
+  // Common field names to check - this is a heuristic
+  // In practice, we'd need to scan more comprehensively
+  const potentialNames = new Set<string>();
 
-  // Try to get properties from the class itself
-  const classProperties = Object.getOwnPropertyNames(dtoClass.prototype);
-
-  // For NestJS GraphQL DTOs, fields are typically defined with @Field() decorator
-  // We need to check both the instance properties and metadata
-
-  // Approach: Create an instance and check what properties exist
-  // Also use reflect-metadata to find decorated fields
-
-  const allPropertyNames = new Set<string>([
-    ...propertyNames,
-    ...classProperties.filter(p => p !== 'constructor'),
-  ]);
-
-  // Check metadata for each potential property
-  for (const propName of allPropertyNames) {
-    const typeMetadata = Reflect.getMetadata(GRAPHQL_METADATA_KEY, prototype, propName);
-    const fieldMetadata = Reflect.getMetadata(FIELD_METADATA_KEY, prototype, propName);
-
-    if (typeMetadata || fieldMetadata) {
-      // Determine if the field is required (nullable: true means optional)
-      const isRequired = !fieldMetadata?.nullable;
-
-      fields.push({
-        name: propName,
-        isRequired,
-        type: typeMetadata,
-      });
-    }
+  // Try to get names from an instance
+  try {
+    const instance = new (dtoClass as new () => object)();
+    Object.keys(instance).forEach(k => potentialNames.add(k));
+    Object.getOwnPropertyNames(instance).forEach(k => potentialNames.add(k));
+  } catch {
+    // Constructor requires arguments, can't create instance
   }
 
-  // Fallback: if no metadata found, try to extract from class properties
-  // This handles cases where DTOs are plain TypeScript classes
-  if (fields.length === 0) {
-    // Use TypeScript's design:type metadata if available
-    for (const propName of allPropertyNames) {
-      if (propName === 'constructor') continue;
+  // Add names from prototype
+  Object.getOwnPropertyNames(prototype)
+    .filter(p => p !== 'constructor')
+    .forEach(p => potentialNames.add(p));
 
-      const designType = Reflect.getMetadata('design:type', prototype, propName);
-      if (designType) {
-        fields.push({
-          name: propName,
-          isRequired: true, // Default to required if we can't determine
-          type: designType,
-        });
-      }
+  // Check each potential name for design:type metadata
+  for (const name of potentialNames) {
+    const designType = Reflect.getMetadata(GRAPHQL_METADATA_KEY, prototype, name);
+    if (designType) {
+      const fieldMeta = Reflect.getMetadata(FIELD_METADATA_KEY, prototype, name);
+      fields.push({
+        name,
+        isRequired: !fieldMeta?.nullable,
+        type: designType,
+      });
     }
   }
 
@@ -71,9 +81,34 @@ export function analyzeDTOClass(dtoClass: Constructor): DTOFieldInfo[] {
 }
 
 /**
+ * Analyzes a NestJS GraphQL DTO class to extract field information.
+ * Returns empty array if fields cannot be determined (validation will be skipped).
+ */
+export function analyzeDTOClass(dtoClass: Constructor): DTOFieldInfo[] {
+  // Try NestJS GraphQL TypeMetadataStorage first
+  const nestJSFields = tryGetNestJSFields(dtoClass);
+  if (nestJSFields && nestJSFields.length > 0) {
+    return nestJSFields;
+  }
+
+  // Fall back to scanning for decorated fields
+  const scannedFields = scanForDecoratedFields(dtoClass);
+  if (scannedFields.length > 0) {
+    return scannedFields;
+  }
+
+  // Could not determine fields - return empty array
+  // Validation will be skipped in this case
+  return [];
+}
+
+/**
  * Validates that a LazyQL class has all required getters for its DTO.
  * Throws MissingGetterError if a required field is missing.
  * Returns warnings for optional fields without getters.
+ *
+ * If DTO fields cannot be detected, validation is skipped and all getters
+ * are registered as field mappings.
  */
 export function validateClass(
   lazyClass: Constructor,
@@ -92,13 +127,25 @@ export function validateClass(
   // Analyze the DTO to get required and optional fields
   const dtoFields = analyzeDTOClass(metadata.dtoClass);
 
+  // If no fields detected, skip strict validation and register all getters
   if (dtoFields.length === 0) {
-    throw new InvalidDTOError(
-      `Could not analyze DTO class "${metadata.dtoClass.name}". ` +
-      `Make sure it has decorated fields or uses reflect-metadata.`
+    warnings.push(
+      `Could not detect fields in DTO "${metadata.dtoClass.name}". ` +
+      `Validation skipped - all getters will be registered.`
     );
+
+    // Register all getters as field mappings
+    for (const getterName of getterMethods) {
+      if (!metadata.sharedMethods.has(getterName)) {
+        const fieldName = getterToFieldName(getterName);
+        metadata.fieldMappings.set(fieldName, getterName);
+      }
+    }
+
+    return warnings;
   }
 
+  // Strict validation when fields are detected
   for (const field of dtoFields) {
     // Check if there's an explicit mapping
     if (explicitMappings.has(field.name)) {

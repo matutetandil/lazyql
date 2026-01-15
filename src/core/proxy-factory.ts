@@ -12,6 +12,74 @@ export const LAZY_INSTANCE = Symbol('lazyql:instance');
 export const IS_LAZY_PROXY = Symbol('lazyql:isProxy');
 
 /**
+ * Symbol used to store the shared cache on the instance
+ */
+const SHARED_CACHE = Symbol('lazyql:sharedCache');
+
+/**
+ * Symbol used to store pending promises for async shared methods
+ */
+const PENDING_SHARED = Symbol('lazyql:pendingShared');
+
+/**
+ * Wraps @Shared methods on the instance to enable caching.
+ * This must be done on the actual instance so that internal calls
+ * (e.g., this.getTotalsData() from within getGrandTotal()) also use the cache.
+ */
+function wrapSharedMethods<T extends object>(
+  instance: T,
+  sharedMethods: Set<string>
+): void {
+  // Initialize cache storage on the instance
+  const cache = new Map<string, unknown>();
+  const pending = new Map<string, Promise<unknown>>();
+
+  (instance as Record<symbol, unknown>)[SHARED_CACHE] = cache;
+  (instance as Record<symbol, unknown>)[PENDING_SHARED] = pending;
+
+  // Wrap each @Shared method
+  for (const methodName of sharedMethods) {
+    const original = (instance as Record<string, unknown>)[methodName];
+
+    if (typeof original !== 'function') {
+      continue;
+    }
+
+    // Replace with wrapped version
+    (instance as Record<string, unknown>)[methodName] = function (this: T, ...args: unknown[]) {
+      // Check if already cached
+      if (cache.has(methodName)) {
+        return cache.get(methodName);
+      }
+
+      // Check if there's a pending promise
+      if (pending.has(methodName)) {
+        return pending.get(methodName);
+      }
+
+      // Execute the original method
+      const result = original.apply(this, args);
+
+      // Handle promises
+      if (result instanceof Promise) {
+        const promise = result.then(value => {
+          cache.set(methodName, value);
+          pending.delete(methodName);
+          return value;
+        });
+
+        pending.set(methodName, promise);
+        return promise;
+      }
+
+      // Sync result - cache directly
+      cache.set(methodName, result);
+      return result;
+    };
+  }
+}
+
+/**
  * Creates a Proxy that intercepts property access and calls the appropriate getter.
  *
  * When GraphQL/Apollo accesses a field like `proxy.status`, the proxy:
@@ -25,8 +93,8 @@ export function createLazyProxy<T extends object>(
   instance: T,
   metadata: LazyQLMetadata
 ): T {
-  const sharedCache = new Map<string, unknown>();
-  const pendingShared = new Map<string, Promise<unknown>>();
+  // Wrap @Shared methods on the instance for caching
+  wrapSharedMethods(instance, metadata.sharedMethods);
 
   return new Proxy(instance, {
     get(target, prop, receiver) {
@@ -64,12 +132,7 @@ export function createLazyProxy<T extends object>(
       const getter = (target as Record<string, unknown>)[getterName];
 
       if (typeof getter === 'function') {
-        // Check if this is a @Shared method
-        if (metadata.sharedMethods.has(getterName)) {
-          return executeSharedMethod(target, getterName, getter, sharedCache, pendingShared);
-        }
-
-        // Execute the getter
+        // Execute the getter (if it's @Shared, it's already wrapped)
         return getter.call(target);
       }
 
@@ -136,47 +199,6 @@ export function createLazyProxy<T extends object>(
       return Reflect.getOwnPropertyDescriptor(target, prop);
     },
   });
-}
-
-/**
- * Executes a @Shared method with caching.
- * Handles both sync and async methods.
- */
-function executeSharedMethod(
-  target: object,
-  methodName: string,
-  method: Function,
-  cache: Map<string, unknown>,
-  pendingPromises: Map<string, Promise<unknown>>
-): unknown {
-  // Check if already cached
-  if (cache.has(methodName)) {
-    return cache.get(methodName);
-  }
-
-  // Check if there's a pending promise (for async methods called multiple times)
-  if (pendingPromises.has(methodName)) {
-    return pendingPromises.get(methodName);
-  }
-
-  // Execute the method
-  const result = method.call(target);
-
-  // Handle promises
-  if (result instanceof Promise) {
-    const promise = result.then(value => {
-      cache.set(methodName, value);
-      pendingPromises.delete(methodName);
-      return value;
-    });
-
-    pendingPromises.set(methodName, promise);
-    return promise;
-  }
-
-  // Sync result - cache directly
-  cache.set(methodName, result);
-  return result;
 }
 
 /**
