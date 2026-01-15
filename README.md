@@ -1,47 +1,17 @@
 # LazyQL
 
-A lightweight TypeScript library that makes GraphQL resolvers truly lazy by default.
+A lightweight TypeScript library for building truly lazy GraphQL resolvers.
 
-## The Problem
+## What is LazyQL?
 
-GraphQL optimizes network payload but not server computation. Developers typically:
-
-1. Fetch all data in root resolvers
-2. Build complete response objects with ALL fields
-3. Let GraphQL filter the response
-
-```typescript
-// Traditional approach - ALL fields are computed
-async getOrder(id: number) {
-  const order = await db.getFullOrder(id);
-  const customer = await db.getCustomer(order.customerId);
-  const consultant = await jde.getConsultant(order.jdeCode);
-
-  return {
-    entity_id: order.id,
-    status: order.status,
-    grand_total: order.total,
-    customer_email: customer.email,        // Computed even if not requested
-    sales_consultant_name: consultant.name  // Computed even if not requested
-  };
-}
-```
-
-## The Solution
-
-LazyQL lets you define models with getter methods. Only the getters for requested fields are executed.
+LazyQL helps you build GraphQL APIs where **only the requested fields are computed**. Define your data as classes with getter methods, and LazyQL ensures each getter runs only when its field is actually requested.
 
 ```typescript
 import { LazyQL, Shared } from 'lazyql';
-import { OrderSummaryDTO } from './dto/order.dto';
 
-@LazyQL(OrderSummaryDTO)
-class OrderSummary {
-  constructor(
-    private id: number,
-    private db: DatabaseService,
-    private jde: JDEService
-  ) {}
+@LazyQL(OrderDTO)
+class Order {
+  constructor(private id: number, private db: Database) {}
 
   getEntityId() {
     return this.id;
@@ -51,41 +21,26 @@ class OrderSummary {
     return this.db.getOrderStatus(this.id);
   }
 
-  getGrandTotal() {
-    return this.db.getOrderTotal(this.id);
-  }
-
   async getCustomerEmail() {
     return await this.db.getCustomerEmail(this.id);
   }
 
-  async getSalesConsultantName() {
-    return await this.jde.getConsultantName(this.id);
-  }
-
-  @Shared()
-  async getOrderDetails() {
-    return await this.db.getFullOrder(this.id);
+  async getShippingAddress() {
+    return await this.db.getShippingAddress(this.id);
   }
 }
 
-// In your resolver - just return instances
-async getOrder(id: number) {
-  return new OrderSummary(id, this.db, this.jde);
-}
-
-async getOrders() {
-  const ids = await this.db.getOrderIds();
-  return ids.map(id => new OrderSummary(id, this.db, this.jde));
+// In your resolver
+async order(id: number) {
+  return new Order(id, this.db);
 }
 ```
 
-**Result:** If the client requests only `{ entity_id, status }`:
-- `getEntityId()` executes
-- `getStatus()` executes
-- `getCustomerEmail()` **never** executes
-- `getSalesConsultantName()` **never** executes
-- JDE service is **never** called
+When a client requests `{ entity_id, status }`:
+- `getEntityId()` runs
+- `getStatus()` runs
+- `getCustomerEmail()` does not run
+- `getShippingAddress()` does not run
 
 ## Installation
 
@@ -93,62 +48,57 @@ async getOrders() {
 npm install lazyql reflect-metadata
 ```
 
-Make sure to import `reflect-metadata` at your application entry point:
+Import `reflect-metadata` at your application entry point:
 
 ```typescript
 import 'reflect-metadata';
 ```
 
-## API
+## Core Concepts
 
-### `@LazyQL(DTO, options?)`
+### `@LazyQL(DTO)`
 
-Class decorator that enables lazy field resolution.
+The main decorator that enables lazy resolution for a class.
 
 ```typescript
-@LazyQL(OrderSummaryDTO)
-class OrderSummary {
-  // ...
-}
+@LazyQL(ProductDTO)
+class Product {
+  constructor(private id: number, private db: Database) {}
 
-// With options
-@LazyQL(OrderSummaryDTO, {
-  debug: true,      // Enable debug logging for this class
-  nestedProxy: true // Auto-wrap nested LazyQL instances
-})
-class DebugOrderSummary {
-  // ...
+  getName() { return this.db.getProductName(this.id); }
+  getPrice() { return this.db.getProductPrice(this.id); }
+  getDescription() { return this.db.getProductDescription(this.id); }
 }
 ```
 
 ### `@Shared()`
 
-Method decorator for caching results within an instance lifecycle.
+Cache expensive operations that multiple getters depend on.
 
 ```typescript
 @LazyQL(OrderDTO)
 class Order {
-  async getGrandTotal() {
-    const details = await this.getOrderDetails();
+  getGrandTotal() {
+    const details = this.getOrderDetails();
     return details.grand_total;
   }
 
-  async getCurrencyCode() {
-    const details = await this.getOrderDetails();
+  getCurrencyCode() {
+    const details = this.getOrderDetails();
     return details.currency_code;
   }
 
   @Shared()
-  async getOrderDetails() {
-    // Executes only once, even if called by multiple getters
-    return await this.db.getFullOrder(this.id);
+  getOrderDetails() {
+    // Runs only once per instance, even if both fields are requested
+    return this.db.getFullOrder(this.id);
   }
 }
 ```
 
-### `@Field(fieldName)`
+### `@Field(name)`
 
-Optional decorator to explicitly map a getter to a DTO field.
+Override the default naming convention for specific getters.
 
 ```typescript
 @LazyQL(OrderDTO)
@@ -162,210 +112,125 @@ class Order {
 
 ## Naming Convention
 
-By default, LazyQL maps `snake_case` DTO fields to `getCamelCase` methods:
+LazyQL automatically maps `snake_case` fields to `getCamelCase` methods:
 
-| DTO Field | Getter Method |
-|-----------|---------------|
+| Field | Method |
+|-------|--------|
 | `status` | `getStatus()` |
 | `entity_id` | `getEntityId()` |
 | `grand_total` | `getGrandTotal()` |
 
-Use `@Field('field_name')` to override this convention when needed.
-
 ## Configuration
 
-### Global Configuration
+### Global Settings
 
 ```typescript
 import { configure } from 'lazyql';
 
 configure({
-  debug: true,              // Enable debug logging globally
-  timing: true,             // Log execution time for getters
-  logger: (level, msg, meta) => {
-    // Custom logger function
-    myLogger[level](msg, meta);
-  },
+  debug: true,    // Log getter executions
+  timing: true,   // Include execution time in logs
+  logger: (level, message, meta) => myLogger.log(level, message, meta),
   onError: (ctx) => {
-    // Custom error handler
-    // Return modified error, or null to suppress
-    return new CustomError(`${ctx.className}.${ctx.fieldName}: ${ctx.error.message}`);
+    // Transform errors or return null to suppress
+    return new CustomError(ctx.error.message);
   }
 });
 ```
 
-### Error Handling
-
-Errors in getters are properly handled and propagated to GraphQL:
+### Per-Class Options
 
 ```typescript
-@LazyQL(OrderDTO)
+@LazyQL(OrderDTO, {
+  debug: true,       // Enable logging for this class
+  nestedProxy: true  // Auto-wrap nested LazyQL instances
+})
 class Order {
-  async getCustomerEmail() {
-    // If this throws, the error is caught and optionally transformed
-    return await this.db.getCustomerEmail(this.id);
-  }
+  // ...
 }
-
-// Configure custom error handling
-configure({
-  onError: ({ className, fieldName, getterName, error }) => {
-    console.error(`Error in ${className}.${getterName}(): ${error.message}`);
-    return error; // Return error to propagate, or null to suppress
-  }
-});
 ```
 
-## Class Inheritance
+## Advanced Features
 
-LazyQL supports class inheritance naturally:
+### Class Inheritance
 
 ```typescript
 @LazyQL(BaseOrderDTO)
-class BaseOrderModel {
+class BaseOrder {
   getEntityId() { return this.id; }
   getStatus() { return this.status; }
 }
 
-@LazyQL(ExtendedOrderDTO)
-class ExtendedOrderModel extends BaseOrderModel {
+@LazyQL(DetailedOrderDTO)
+class DetailedOrder extends BaseOrder {
   // Inherits getEntityId() and getStatus()
-  getExtraField() { return this.extra; }
+  getLineItems() { return this.db.getLineItems(this.id); }
 }
 ```
 
-## Nested LazyQL Objects
+### Nested Objects
 
-When `nestedProxy: true` is enabled, returned objects that are instances of registered LazyQL classes are automatically wrapped:
+With `nestedProxy: true`, returned LazyQL instances are automatically wrapped:
 
 ```typescript
 @LazyQL(CategoryDTO)
-class CategoryModel {
+class Category {
   getName() { return this.name; }
   getProductCount() { return this.db.countProducts(this.id); }
 }
 
 @LazyQL(ProductDTO, { nestedProxy: true })
-class ProductModel {
+class Product {
   getCategory() {
-    // Returns a CategoryModel instance - automatically proxied
-    return new CategoryModel(this.categoryId, this.db);
-  }
-
-  getRelatedProducts() {
-    // Arrays are also handled
-    return this.relatedIds.map(id => new ProductModel(id, this.db));
+    // Automatically wrapped - category fields are also lazy
+    return new Category(this.categoryId, this.db);
   }
 }
 ```
 
-## DataLoader Integration
+### DataLoader Integration
 
-LazyQL integrates naturally with DataLoader to solve the N+1 problem:
+LazyQL works naturally with DataLoader for batching:
 
 ```typescript
-// Create request-scoped loaders
-function createLoaders(context) {
-  return {
-    customer: new DataLoader(ids => db.getCustomers(ids)),
-    product: new DataLoader(ids => db.getProducts(ids))
-  };
-}
-
 @LazyQL(OrderDTO)
-class OrderModel {
+class Order {
   constructor(
     private id: number,
     private customerId: number,
-    private loaders: Loaders
+    private loaders: DataLoaders
   ) {}
 
-  getEntityId() { return this.id; }
-
   async getCustomerEmail() {
-    // Uses DataLoader - batched across all OrderModel instances
+    // Batched across all Order instances in the request
     const customer = await this.loaders.customer.load(this.customerId);
     return customer.email;
   }
 }
 
 // In resolver
-async orders(context) {
-  const loaders = createLoaders(context);
-  const ids = await db.getOrderIds();
-  return ids.map(id => new OrderModel(id, loaders));
+async orders() {
+  const loaders = createLoaders(); // Request-scoped
+  const ids = await this.db.getOrderIds();
+  return ids.map(id => new Order(id, loaders));
 }
 ```
 
-**Result:** If 100 orders reference 50 unique customers:
-- Without DataLoader: 100 database calls
-- With DataLoader: 1 batched database call
+## How It Works
+
+1. `@LazyQL` wraps your class to return a JavaScript Proxy
+2. When GraphQL accesses a field, the Proxy intercepts it
+3. The Proxy finds and executes the corresponding getter
+4. Results are returned to GraphQL as normal
+
+This works transparently with Apollo, Mercurius, or any GraphQL server.
 
 ## Validation
 
 LazyQL validates your classes at startup:
 
-- **Required field without getter:** Application fails to start
-- **Optional field without getter:** Warning logged, returns `null`
-
-## How It Works
-
-1. The `@LazyQL` decorator wraps your class to return a JavaScript Proxy
-2. When GraphQL accesses a field (e.g., `instance.status`), the Proxy intercepts it
-3. The Proxy maps `status` → `getStatus()` and executes the getter
-4. Only requested fields have their getters executed
-
-This is completely transparent to Apollo/Cosmo - no plugins or configuration needed.
-
-## Test Coverage
-
-LazyQL includes comprehensive unit tests:
-
-```bash
-npm test
-```
-
-- **getter-mapper:** 10 tests for field name conversion
-- **proxy-factory:** 35 tests for Proxy behavior, @Shared caching, error handling, debug mode, inheritance, and nested proxy
-- **validator:** 14 tests for DTO field detection, validation, and nullability detection
-- **dataloader-pattern:** 4 tests demonstrating DataLoader integration patterns
-
-**Total: 63 tests**
-
-### Test Microservice
-
-The `test-ms/` directory contains a NestJS application demonstrating LazyQL with:
-
-- **Orders module:** 10 fields with @Shared methods
-- **Products module:** Nested DTOs (CategoryDTO, InventoryDTO)
-- **Comparison endpoints:** LazyQL vs traditional approach
-
-```bash
-cd test-ms
-npm install
-npm run start
-# Visit http://localhost:3000/graphql
-```
-
-Example queries to compare performance:
-
-```graphql
-# LazyQL - only fetches requested fields
-query {
-  product(id: 1) {
-    name
-    price
-  }
-}
-
-# Traditional - fetches EVERYTHING
-query {
-  productTraditional(id: 1) {
-    name
-    price
-  }
-}
-```
+- Required fields without getters cause an error
+- Optional fields without getters return `null` (with a warning)
 
 ## Requirements
 
