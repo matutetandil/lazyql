@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Documentation
+
+- Added "The DTO-Getter Connection" section to README explaining the relationship between GraphQL DTOs and getter methods
+- Included example DTO with @ObjectType and @Field decorators
+- Added mapping table showing snake_case fields → getCamelCase methods
+- Removed redundant "Naming Convention" section
+
 ## [0.3.0] - 2026-01-15
 
 ### Added

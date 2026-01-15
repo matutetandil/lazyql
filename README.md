@@ -10,10 +10,45 @@ A lightweight TypeScript library for building truly lazy GraphQL resolvers.
 
 LazyQL helps you build GraphQL APIs where **only the requested fields are computed**. Define your data as classes with getter methods, and LazyQL ensures each getter runs only when its field is actually requested.
 
+## The DTO-Getter Connection
+
+In GraphQL (especially with NestJS), you define **DTOs** (Data Transfer Objects) that describe the shape of your responses:
+
+```typescript
+// Your GraphQL ObjectType (DTO)
+@ObjectType()
+class OrderDTO {
+  @Field(() => Int)
+  entity_id: number;
+
+  @Field()
+  status: string;
+
+  @Field({ nullable: true })
+  customer_email?: string;
+
+  @Field({ nullable: true })
+  shipping_address?: string;
+}
+```
+
+**LazyQL connects this DTO to your model class.** Each field in the DTO maps to a getter method:
+
+| DTO Field | Getter Method | Why? |
+|-----------|---------------|------|
+| `entity_id` | `getEntityId()` | `snake_case` → `getCamelCase` |
+| `status` | `getStatus()` | |
+| `customer_email` | `getCustomerEmail()` | |
+| `shipping_address` | `getShippingAddress()` | |
+
+The `@LazyQL(OrderDTO)` decorator tells LazyQL to validate that your class has getters for all required DTO fields, and creates a Proxy that intercepts field access to call the right getter.
+
+## Quick Example
+
 ```typescript
 import { LazyQL, Shared } from 'lazyql';
 
-@LazyQL(OrderDTO)
+@LazyQL(OrderDTO)  // Links this class to the DTO above
 class Order {
   constructor(private id: number, private db: Database) {}
 
@@ -113,16 +148,6 @@ class Order {
   }
 }
 ```
-
-## Naming Convention
-
-LazyQL automatically maps `snake_case` fields to `getCamelCase` methods:
-
-| Field | Method |
-|-------|--------|
-| `status` | `getStatus()` |
-| `entity_id` | `getEntityId()` |
-| `grand_total` | `getGrandTotal()` |
 
 ## Configuration
 
